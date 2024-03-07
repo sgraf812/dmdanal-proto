@@ -1,4 +1,3 @@
-{-# LINE 6 "Interpreter.lhs" #-}
 {-#  OPTIONS_GHC -Wno-simplifiable-class-constraints  #-}
 {-#  LANGUAGE DerivingStrategies  #-}
 {-#  LANGUAGE DerivingVia  #-}
@@ -73,7 +72,6 @@ takeT n (Step e t) = Step e (takeT (n-1) t)
 
 takeName :: Int -> ByName T a -> T (Maybe a)
 takeName n (ByName τ) = takeT n τ
-{-# LINE 123 "Interpreter.lhs" #-}
 type (:->) = Map; emp :: Ord k => k :-> v
 ext :: Ord k => (k :-> v) -> k -> v -> (k :-> v)
 exts :: Ord k  => (k :-> v) -> [k] -> [v]
@@ -83,7 +81,6 @@ dom :: Ord k => (k :-> v) -> Set k
 (∈) :: Ord k => k -> Set k -> Bool
 (<<) :: (b -> c) -> (a :-> b) -> (a :-> c)
 assocs :: (k :-> v) -> [(k,v)]
-{-# LINE 135 "Interpreter.lhs" #-}
 emp = Map.empty
 ext ρ x d = Map.insert x d ρ
 exts ρ xs ds = foldl' (uncurry . ext) ρ (zip xs ds)
@@ -94,13 +91,11 @@ infixr 9 <<
 dom = Map.keysSet
 (∈) = Set.member
 assocs = Map.assocs
-{-# LINE 188 "Interpreter.lhs" #-}
 type D τ = τ (Value τ);   type DName = D T
 data T v = Step Event (T v) | Ret v
 data Event  =  Lookup Name | Update | App1 | App2
             |  Let0 | Let1 | Case1 | Case2
 data Value τ = Stuck | Fun (D τ -> D τ) | Con Tag [D τ]
-{-# LINE 204 "Interpreter.lhs" #-}
 instance Functor T where
   fmap f (Ret a) = Ret (f a)
   fmap f (Step e t) = Step e (fmap f t)
@@ -110,13 +105,12 @@ instance Applicative T where
 instance Monad T where
   Ret v >>= k = k v
   Step e τ >>= k = Step e (τ >>= k)
-{-# LINE 241 "Interpreter.lhs" #-}
 eval  ::  (Trace d, Domain d, HasBind d)
       =>  Exp -> (Name :-> d) -> d
 eval e ρ = case e of
   Var x  | x ∈ dom ρ  -> ρ ! x
          | otherwise  -> stuck
-  Lam x body -> fun x (label e) $ \d ->
+  Lam x body -> fun x $ \d ->
     step App2 (eval body ((ext ρ x d)))
   App e x  | x ∈ dom ρ  -> step App1 $
                apply (eval e ρ) (ρ ! x)
@@ -126,46 +120,44 @@ eval e ρ = case e of
     (\d1 -> step Let1 (eval e2 (ext ρ x (step (Lookup x) d1))))
   ConApp k xs
     | all (∈ dom ρ) xs, length xs == conArity k
-    -> con (label e) k (map (ρ !) xs)
+    -> con k (map (ρ !) xs)
     | otherwise
     -> stuck
   Case e alts -> step Case1 $
     select (eval e ρ) (cont << alts)
     where
-       cont (xs, er) ds  |  length xs == length ds
-                         =  step Case2 (eval er (exts ρ xs ds))
-                         |  otherwise
-                         =  stuck
-{-# LINE 270 "Interpreter.lhs" #-}
+       cont (xs, er) = (xs, f xs er)
+       f xs er ds  |  length xs == length ds
+                   =  step Case2 (eval er (exts ρ xs ds))
+                   |  otherwise
+                   =  stuck
 class Trace d where
   step :: Event -> d -> d
 
 class Domain d where
   stuck :: d
-  fun :: Name -> Label -> (d -> d) -> d
+  fun :: Name -> (d -> d) -> d
   apply :: d -> d -> d
-  con :: Label -> Tag -> [d] -> d
-  select :: d -> (Tag :-> ([d] -> d)) ->  d
+  con :: Tag -> [d] -> d
+  select :: d -> (Tag :-> ([Name], [d] -> d)) ->  d
 
 class HasBind d where
   bind :: Name -> (d -> d) -> (d -> d) -> d
-{-# LINE 287 "Interpreter.lhs" #-}
 instance Trace (T v) where
   step = Step
 
 instance Monad τ => Domain (D τ) where
   stuck = return Stuck
-  fun _ _ f = return (Fun f)
+  fun _ f = return (Fun f)
   apply  d a = d >>= \v -> case v of
     Fun f -> f a; _ -> stuck
-  con _ k ds = return (Con k ds)
+  con k ds = return (Con k ds)
   select dv alts = dv >>= \v -> case v of
-    Con k ds | k ∈ dom alts  -> (alts ! k) ds
+    Con k ds | k ∈ dom alts  -> snd (alts ! k) ds
     _                        -> stuck
 
-     
-              
-{-# LINE 458 "Interpreter.lhs" #-}
+
+
 evalName e ρ = eval e ρ :: D (ByName T)
 newtype ByName τ v = ByName { unByName :: (τ v) }
   deriving newtype (Functor,Applicative,Monad)
@@ -175,7 +167,6 @@ instance Trace (τ v) => Trace (ByName τ v) where
 
 instance HasBind (D (ByName τ)) where
   bind _ rhs body = body (fix rhs)
-{-# LINE 503 "Interpreter.lhs" #-}
 evalNeed e ρ μ = unByNeed (eval e ρ :: D (ByNeed T)) μ
 
 type Addr = Int; type Heap τ = Addr :-> D τ; nextFree :: Heap τ -> Addr
@@ -183,7 +174,7 @@ newtype ByNeed τ v = ByNeed { unByNeed :: Heap (ByNeed τ) -> τ (v, Heap (ByNe
 
 getN  :: Monad τ => ByNeed τ (Heap (ByNeed τ));         getN    = ByNeed (\ μ -> return (μ, μ))
 putN  :: Monad τ => Heap (ByNeed τ) -> ByNeed τ ();    putN μ  = ByNeed (\ _ -> return ((), μ))
-         
+
 
 instance (forall v. Trace (τ v)) => Trace (ByNeed τ v) where step e m = ByNeed (step e . unByNeed m)
 
@@ -199,7 +190,6 @@ instance (Monad τ, forall v. Trace (τ v)) => HasBind (D (ByNeed τ)) where
                         let a = nextFree μ
                         putN (ext μ a (memoN a (rhs (fetchN a))))
                         body (fetchN a)
-{-# LINE 529 "Interpreter.lhs" #-}
 nextFree h = case Map.lookupMax h of
   Nothing     -> 0
   Just (k,_)  -> k+1
@@ -207,13 +197,12 @@ nextFree h = case Map.lookupMax h of
 deriving via StateT (Heap (ByNeed τ)) τ instance Functor τ  => Functor (ByNeed τ)
 deriving via StateT (Heap (ByNeed τ)) τ instance Monad τ    => Applicative (ByNeed τ)
 deriving via StateT (Heap (ByNeed τ)) τ instance Monad τ    => Monad (ByNeed τ)
-{-# LINE 666 "Interpreter.lhs" #-}
 evalValue e ρ = eval e ρ :: D (ByValue T)
 
 newtype ByValue τ v = ByValue { unByValue :: τ v }
-         
-instance Trace (τ v) => Trace (ByValue τ v) where 
-  step e (ByValue τ) = ByValue (step e τ) 
+
+instance Trace (τ v) => Trace (ByValue τ v) where
+  step e (ByValue τ) = ByValue (step e τ)
 
 class Extract τ where getValue :: τ v -> v
 instance Extract T where getValue (Ret v) = v; getValue (Step _ τ) = getValue τ
@@ -222,11 +211,9 @@ instance (Trace (D (ByValue τ)), Monad τ, Extract τ) => HasBind (D (ByValue �
   bind _ rhs body = step Let0 (do  v1 <- d; body (return v1))
                                    where  d = rhs (return v)          :: D (ByValue τ)
                                           v = getValue (unByValue d)  :: Value (ByValue τ)
-{-# LINE 683 "Interpreter.lhs" #-}
 deriving instance Functor τ     => Functor (ByValue τ)
 deriving instance Applicative τ => Applicative (ByValue τ)
 deriving instance Monad τ       => Monad (ByValue τ)
-{-# LINE 755 "Interpreter.lhs" #-}
 evalVInit e ρ μ = unByVInit (eval e ρ :: D (ByVInit T)) μ
 
 newtype ByVInit τ v = ByVInit { unByVInit :: Heap (ByVInit τ) -> τ (v, Heap (ByVInit τ)) }
@@ -235,7 +222,6 @@ instance (Monad τ, forall v. Trace (τ v)) => HasBind (D (ByVInit τ)) where
                         let a = nextFree μ
                         putV (ext μ a stuck)
                         step Let0 (memoV a (rhs (fetchV a))) >>= body . return
-{-# LINE 766 "Interpreter.lhs" #-}
 deriving via StateT (Heap (ByVInit τ)) τ instance Functor τ  => Functor (ByVInit τ)
 deriving via StateT (Heap (ByVInit τ)) τ instance Monad τ    => Applicative (ByVInit τ)
 deriving via StateT (Heap (ByVInit τ)) τ instance Monad τ    => Monad (ByVInit τ)
@@ -254,7 +240,6 @@ memoV :: forall τ. (Monad τ, forall v. Trace (τ v)) => Addr -> D (ByVInit τ)
 memoV a d = d >>= \v -> ByVInit (upd v)
   where  upd Stuck  μ = return (Stuck :: Value (ByVInit τ), μ)
          upd v      μ = return (v, ext μ a (memoV a (return v)))
-{-# LINE 827 "Interpreter.lhs" #-}
 evalClair e ρ = runClair $ eval e ρ :: T (Value (Clairvoyant T))
 
 data Fork f a = Empty | Single !a | Fork (f a) (f a)
