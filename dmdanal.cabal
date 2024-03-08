@@ -30,3 +30,4 @@ test-suite tests
     hs-source-dirs: tests
     main-is:    Main.hs
     build-depends: base, dmdanal, tasty, tasty-hunit
+    ghc-options: -threaded

@@ -8,6 +8,9 @@ import DmdAnal
 
 import Data.List
 import Data.Ord
+import System.Timeout
+import Control.Monad.IO.Class (liftIO)
+import GHC.Exts
 
 main = defaultMain tests
 
@@ -17,8 +20,10 @@ tests = testGroup "Tests" [unitTests]
 golden :: String -> String -> SubDemand -> String -> TestTree
 golden info input sd output = testCase info $ do
   let expected = output
-  let actual   = show (dmdAnal (read input) sd)
-  actual == expected @? "expected: " ++ expected ++ "\n but got: " ++ actual
+  mb_actual <- liftIO $ timeout 100000 (return $! lazy (show (dmdAnal (read input) sd)))
+  case mb_actual of
+    Nothing     -> assertFailure "diverges"
+    Just actual -> actual == expected @? "expected: " ++ expected ++ "\n but got: " ++ actual
 
 unitTests = testGroup "Unit tests"
   [ golden "const expr"
@@ -38,12 +43,12 @@ unitTests = testGroup "Unit tests"
            \   FF() -> λz. z }"
            (callCtx 2)
            "{b↦1*HU,f↦1*Ap[1;Ap[1;U]],y↦1*HU,z↦ω*HU}|>."
-  , golden "DataCon values Some(f)"
+  , golden "DataCon values Some(const)"
            "let const = λx.λy.x in \
-           \let x = Some(const) in \
-           \case x of { Some(f) -> f x it; None() -> x }"
-           (callCtx 2)
-           "{it↦A}|>."
+           \let z = Some(const) in \
+           \case z of { Some(f) -> f x1 x2; None() -> x3 }"
+           Top
+           "{x1↦1*U}|>."
   ]
 
 -- qcProps = testGroup "(checked by QuickCheck)"

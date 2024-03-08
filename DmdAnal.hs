@@ -163,9 +163,9 @@ topEnv :: Set Name -> DmdEnv
 topEnv fvs = Map.fromSet (const topDmd) fvs
 
 mkDmdFun :: Demand -> DmdT DmdVal -> DmdVal
-mkDmdFun d (φ :|> v) | d == topDmd, all (== topDmd) φ, DmdNop fvs <- v, topEnv fvs == φ = DmdNop fvs
-                     | d == absDmd, all (== absDmd) φ, DmdBot <- v                      = DmdBot
-                     | otherwise                                                        = DmdFun d (φ :|> v)
+mkDmdFun d (φ :|> v) | d == topDmd, DmdNop fvs <- v, topEnv fvs == φ = v
+                     | d == absDmd, all (== absDmd) φ, DmdBot <- v   = DmdBot
+                     | otherwise                                     = DmdFun d (φ :|> v)
 
 --------------------------
 -- Domain definition
@@ -202,10 +202,10 @@ valueShell d (_ :* sd) = case d sd of _ :|> v -> go v
     go (DmdNop _)           = DmdNop Set.empty
     go DmdBot               = DmdBot
 
-delFV :: DmdT DmdVal -> Name -> DmdT DmdVal
-delFV (φ :|> v) x = Map.delete x φ :|> del_value v
+delFV :: Name -> DmdT DmdVal -> DmdT DmdVal
+delFV x (φ :|> v) = Map.delete x φ :|> del_value v
   where
-    del_value (DmdFun d τ) = mkDmdFun d (delFV τ x)
+    del_value (DmdFun d τ) = mkDmdFun d (delFV x τ)
     del_value v = v
 
 instance Domain DmdD where
@@ -215,7 +215,7 @@ instance Domain DmdD where
     let (_n,sd') = asAp sd in -- _n is the one-shot annotation
     let τ = f proxy sd' in
     let d = Map.findWithDefault absDmd x (squeezeTSubDmd τ sd') in
-    emp :|> mkDmdFun d (delFV τ x)
+    emp :|> mkDmdFun d (delFV x τ)
   con k ds = \sd ->
     let seq_dmds = replicate (length ds) absDmd in
     let top_dmds = replicate (length ds) topDmd in
@@ -234,15 +234,28 @@ instance Domain DmdD where
       φ :|> DmdFun dmd (φ' :|> v') -> (φ + φ' + squeezeDmd arg dmd) :|> v'
       φ :|> v                      -> (φ + squeezeDmd arg topDmd  ) :|> DmdNop (valFVs v)
   select scrut fs = \sd ->
-    let φ' :|> (scrut_sd,v) = lub (map (alt sd) (Map.assocs fs)) in
-    let φ  :|> _v = scrut scrut_sd in -- TODO: fixpoint for value _v? Currently we say DmdNop for field denotations
-    (φ+φ') :|> v
+    let nop_fields (xs, _f) = map (const (DmdNop Set.empty)) xs in
+    let nop_scrut_v = DmdCon (nop_fields << fs) in -- the worst case value
+    let iter v_scrut =
+          let φ' :|> (scrut_sd,v_rhss) = lub (map (alt v_scrut sd) (Map.assocs fs)) in
+          let φ  :|> v_scrut' = scrut scrut_sd in -- TODO: fixpoint for value _v? Currently we say DmdNop for field denotations
+          (v_scrut', (φ+φ') :|> v_rhss) in
+    snd (iter (kleeneFixFrom nop_scrut_v (fst . iter)))
     where
-      alt sd (k,(xs,f)) =
-        let proxies   = map (\x -> step (Lookup x) (whnf (DmdNop Set.empty))) xs in
-        let φ :|> v   = f proxies sd in
-        let (ds,φ')   = (map (\x -> Map.findWithDefault absDmd x φ) xs,foldr Map.delete φ xs) in
-        φ' :|> (mkSingleSel k ds, v)
+      alt v_scrut sd (k,(xs,f)) = case lookupDmdCon k v_scrut of
+        Nothing -> bottom -- dead code path; return bot
+        Just vs ->
+          let proxies = zipWithEqual (\x v -> step (Lookup x) (whnf v)) xs vs in
+          let τ = f proxies sd in
+          let ds = let φ = squeezeTSubDmd τ sd in
+                   map (\x -> Map.findWithDefault absDmd x φ) xs in
+          let φ :|> v = foldr delFV τ xs in
+          φ :|> (mkSingleSel k ds, v)
+
+lookupDmdCon :: Tag -> DmdVal -> Maybe [DmdVal]
+lookupDmdCon k (DmdCon kvs) = Map.lookup k kvs
+lookupDmdCon k (DmdNop _)   = Just (replicate (conArity k) (DmdNop Set.empty)) -- TODO: Assert that DmdNop has no free vars
+lookupDmdCon _ _ = Nothing -- DmdBot, DmdFun
 
 instance HasBind DmdD where
   bind x rhs body = \sd ->
@@ -295,13 +308,11 @@ instance Eq SubDemand where
   _   == _         = False
 
 instance Eq DmdVal where
-  DmdFun d1 τ1 == DmdFun d2 τ2 = d1 == d2 && τ1 == τ2
-  DmdNop fvs1 == DmdNop fvs2 = fvs1 == fvs2
-  DmdNop fvs == DmdFun d2 (φ2 :|> v2) = topDmd == d2 && φ2 == topEnv fvs && DmdNop fvs == v2
-  DmdNop _ == DmdBot = False
   DmdBot == DmdBot = True
-  DmdBot == DmdFun d2 (φ2 :|> v2) = absDmd == d2 && Map.null φ2 && DmdBot == v2
-  l      == r      = r == l
+  DmdFun d1 τ1 == DmdFun d2 τ2 = d1 == d2 && τ1 == τ2
+  DmdCon dkvs1 == DmdCon dkvs2 = dkvs1 == dkvs2
+  DmdNop fvs1 == DmdNop fvs2 = fvs1 == fvs2
+  _      == _      = False
 
 instance Show U where
   show U0 = "0"
@@ -334,7 +345,7 @@ instance Show v => Show (DmdT v) where
 
 instance Show DmdVal where
   show DmdBot = "⊥"
-  show (DmdNop fvs) = "." ++ if Set.null fvs then "" else show fvs
+  show (DmdNop fvs) = "." ++ if Set.null fvs then "" else showSet showString (Set.toList fvs) ""
   show (DmdFun d τ) = "λ" ++ show d ++ "." ++ show τ
   show (DmdCon dkvs) = "Con[" ++ showSep (showString ";") (map single (Map.assocs dkvs)) "]"
     where
