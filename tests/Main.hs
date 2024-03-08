@@ -29,15 +29,21 @@ unitTests = testGroup "Unit tests"
            "let const = λx.λy.x in const"
            (callCtx 2)
            "{}|>λ1*U.{}|>λA.{}|>."
-  , golden "recursive tail call of free var"
-           "let recfun = λx.case x of {\
-           \   TT() -> recfun z;\
+  , golden "eta-expandable loop with call in exit"
+           "let loop = λx.case x of {\
+           \   TT() -> loop z;\
            \   FF() -> f } in \
            \case b of { \
-           \   TT() -> recfun y;\
+           \   TT() -> loop y;\
            \   FF() -> λz. z }"
            (callCtx 2)
            "{b↦1*HU,f↦1*Ap[1;Ap[1;U]],y↦1*HU,z↦ω*HU}|>."
+  , golden "DataCon values Some(f)"
+           "let const = λx.λy.x in \
+           \let x = Some(const) in \
+           \case x of { Some(f) -> f x it; None() -> x }"
+           (callCtx 2)
+           "{it↦A}|>."
   ]
 
 -- qcProps = testGroup "(checked by QuickCheck)"

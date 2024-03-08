@@ -7,6 +7,8 @@ import Exp
 import Order
 import Interpreter
 import qualified Data.Map as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 -- import Debug.Trace
 
 ---------------------
@@ -30,7 +32,11 @@ newtype DmdT a = DmdT (DmdEnv, a) deriving (Eq, Lat) via (DmdEnv,a)
 pattern φ :|> v = DmdT (φ, v)
 {-# COMPLETE (:|>) #-}
 
-data DmdVal = DmdFun Demand (DmdT DmdVal) | DmdNop | DmdBot
+data DmdVal
+  = DmdBot
+  | DmdFun Demand (DmdT DmdVal)
+  | DmdCon (Tag :-> [DmdVal])
+  | DmdNop (Set Name)
 
 type DmdD = SubDemand -> DmdT DmdVal
 
@@ -108,13 +114,21 @@ instance (Ord k, UVec u) => UVec (k :-> u) where
   (+) = Map.unionWith (+)
   u * m = Map.map (u *) m
 
+valFVs :: DmdVal -> Set Name
+valFVs DmdBot = Set.empty
+valFVs (DmdNop fvs) = fvs
+valFVs (DmdFun _ (φ :|> v)) = dom φ `Set.union` valFVs v
+valFVs (DmdCon kvs) = foldr (Set.union . Set.unions . map valFVs) Set.empty kvs
+
 instance Lat DmdVal where
   bottom = DmdBot
-  DmdNop ⊔ _ = DmdNop
-  _ ⊔ DmdNop = DmdNop
+  DmdNop fvs ⊔ v = DmdNop (fvs `Set.union` valFVs v)
+  v ⊔ DmdNop fvs = DmdNop (fvs `Set.union` valFVs v)
   DmdBot ⊔ v = v
   v ⊔ DmdBot = v
   DmdFun d1 τ1 ⊔ DmdFun d2 τ2 = mkDmdFun (d1 ⊔ d2) (τ1 ⊔ τ2)
+  DmdCon dkvs1 ⊔ DmdCon dkvs2 = DmdCon (Map.unionWith (zipWithEqual (⊔)) dkvs1 dkvs2)
+  v1 ⊔ v2 = DmdNop (valFVs v1 `Set.union` valFVs v2)
 
 ---------------------------
 -- (Smart) Constructors
@@ -145,10 +159,13 @@ topDmd = Uω :* Top
 whnf :: DmdVal -> DmdD
 whnf v = \_sd -> emp :|> v
 
+topEnv :: Set Name -> DmdEnv
+topEnv fvs = Map.fromSet (const topDmd) fvs
+
 mkDmdFun :: Demand -> DmdT DmdVal -> DmdVal
-mkDmdFun d (φ :|> v) | d == topDmd, DmdNop <- v, all (== absDmd) φ = DmdNop
-                     | d == absDmd, DmdBot <- v, all (== absDmd) φ = DmdBot
-                     | otherwise                = DmdFun d (φ :|> v)
+mkDmdFun d (φ :|> v) | d == topDmd, all (== topDmd) φ, DmdNop fvs <- v, topEnv fvs == φ = DmdNop fvs
+                     | d == absDmd, all (== absDmd) φ, DmdBot <- v                      = DmdBot
+                     | otherwise                                                        = DmdFun d (φ :|> v)
 
 --------------------------
 -- Domain definition
@@ -163,7 +180,7 @@ squeezeTSubDmd (φ :|> v) sd = φ + squeeze_val sd v
   where
     squeeze_val sd (DmdFun _ (φ :|> v))
       | (n,sd') <- asAp sd = n*φ + squeeze_val sd' v
-    squeeze_val _ _ = emp -- DmdNop, DmdBot
+    squeeze_val _ _ = emp -- DmdNop, DmdBot, DmdCon. NB: DmdCon has no valFVs!!!
 
 squeezeSubDmd :: DmdD -> SubDemand -> DmdEnv
 squeezeSubDmd f sd = squeezeTSubDmd (f sd) sd
@@ -175,6 +192,16 @@ squeezeDmd d (n :* sd)
   | Uω <- n = squeezeSubDmd d Seq + squeezeSubDmd d sd
   | otherwise = error "UNonAbs"
 
+-- | We will have `valFVs (valueShell d sd) == Set.empty`.
+valueShell :: DmdD -> Demand -> DmdVal
+valueShell _ Abs       = DmdBot
+valueShell d (_ :* sd) = case d sd of _ :|> v -> go v
+  where
+    go (DmdFun d (_ :|> v)) = DmdFun d (emp :|> go v)
+    go (DmdCon dkvs)        = DmdCon (Map.map (map go) dkvs)
+    go (DmdNop _)           = DmdNop Set.empty
+    go DmdBot               = DmdBot
+
 delFV :: DmdT DmdVal -> Name -> DmdT DmdVal
 delFV (φ :|> v) x = Map.delete x φ :|> del_value v
   where
@@ -184,7 +211,7 @@ delFV (φ :|> v) x = Map.delete x φ :|> del_value v
 instance Domain DmdD where
   stuck = whnf DmdBot
   fun x f = \sd ->
-    let proxy = step (Lookup x) (whnf DmdNop) in
+    let proxy = step (Lookup x) (whnf (DmdNop Set.empty)) in
     let (_n,sd') = asAp sd in -- _n is the one-shot annotation
     let τ = f proxy sd' in
     let d = Map.findWithDefault absDmd x (squeezeTSubDmd τ sd') in
@@ -200,19 +227,19 @@ instance Domain DmdD where
           Seq -> seq_dmds
           _   -> top_dmds in
     let φ = foldr (+) emp (zipWith squeezeDmd ds dmds) in
-    φ :|> DmdNop
+    φ :|> DmdCon (Map.singleton k (zipWith valueShell ds dmds))
   apply f arg = \sd ->
     case f (Ap U1 sd) of
-      φ :|> DmdFun dmd (φ' :|> v') -> (φ + φ' + squeezeDmd arg dmd) :|> v'
-      φ :|> DmdNop                 -> (φ + squeezeDmd arg topDmd  ) :|> DmdNop
       φ :|> DmdBot                 -> (φ + emp                    ) :|> DmdBot
+      φ :|> DmdFun dmd (φ' :|> v') -> (φ + φ' + squeezeDmd arg dmd) :|> v'
+      φ :|> v                      -> (φ + squeezeDmd arg topDmd  ) :|> DmdNop (valFVs v)
   select scrut fs = \sd ->
     let φ' :|> (scrut_sd,v) = lub (map (alt sd) (Map.assocs fs)) in
     let φ  :|> _v = scrut scrut_sd in -- TODO: fixpoint for value _v? Currently we say DmdNop for field denotations
     (φ+φ') :|> v
     where
       alt sd (k,(xs,f)) =
-        let proxies   = map (\x -> step (Lookup x) (whnf DmdNop)) xs in
+        let proxies   = map (\x -> step (Lookup x) (whnf (DmdNop Set.empty))) xs in
         let φ :|> v   = f proxies sd in
         let (ds,φ')   = (map (\x -> Map.findWithDefault absDmd x φ) xs,foldr Map.delete φ xs) in
         φ' :|> (mkSingleSel k ds, v)
@@ -236,7 +263,7 @@ instance HasBind DmdD where
 dmdAnal :: Exp -> DmdD
 dmdAnal e = eval e initialEnv
   where
-    initialEnv = Map.fromSet (\x -> step (Lookup x) (whnf DmdNop)) (freeVars e)
+    initialEnv = Map.fromSet (\x -> step (Lookup x) (whnf (DmdNop Set.empty))) (freeVars e)
 
 
 anyCtx :: String -> DmdT DmdVal
@@ -269,9 +296,9 @@ instance Eq SubDemand where
 
 instance Eq DmdVal where
   DmdFun d1 τ1 == DmdFun d2 τ2 = d1 == d2 && τ1 == τ2
-  DmdNop == DmdNop = True
-  DmdNop == DmdFun d2 (φ2 :|> v2) = topDmd == d2 && Map.null φ2 && DmdNop == v2
-  DmdNop == DmdBot = False
+  DmdNop fvs1 == DmdNop fvs2 = fvs1 == fvs2
+  DmdNop fvs == DmdFun d2 (φ2 :|> v2) = topDmd == d2 && φ2 == topEnv fvs && DmdNop fvs == v2
+  DmdNop _ == DmdBot = False
   DmdBot == DmdBot = True
   DmdBot == DmdFun d2 (φ2 :|> v2) = absDmd == d2 && Map.null φ2 && DmdBot == v2
   l      == r      = r == l
@@ -307,5 +334,8 @@ instance Show v => Show (DmdT v) where
 
 instance Show DmdVal where
   show DmdBot = "⊥"
-  show DmdNop = "."
+  show (DmdNop fvs) = "." ++ if Set.null fvs then "" else show fvs
   show (DmdFun d τ) = "λ" ++ show d ++ "." ++ show τ
+  show (DmdCon dkvs) = "Con[" ++ showSep (showString ";") (map single (Map.assocs dkvs)) "]"
+    where
+      single (k, vs) = shows k . showString "(" . showSep (showString ",") (map shows vs) . showString ")"
