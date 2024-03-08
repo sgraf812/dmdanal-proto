@@ -11,23 +11,33 @@ import Data.Ord
 
 main = defaultMain tests
 
-dmdAnal :: String -> DmdD
-dmdAnal e = eval (read e) emp
-
 tests :: TestTree
 tests = testGroup "Tests" [unitTests]
 
 golden :: String -> String -> SubDemand -> String -> TestTree
 golden info input sd output = testCase info $ do
-  show (dmdAnal input sd) @?= output
+  let expected = output
+  let actual   = show (dmdAnal (read input) sd)
+  actual == expected @? "expected: " ++ expected ++ "\n but got: " ++ actual
 
 unitTests = testGroup "Unit tests"
-  [ golden "const expr" "λx.λy.x"
+  [ golden "const expr"
+           "λx.λy.x"
            (callCtx 2)
            "{}|>λ1*U.{}|>λA.{}|>."
-  , golden "const expr" "let const = λx.λy.x in const"
+  , golden "const binding"
+           "let const = λx.λy.x in const"
            (callCtx 2)
            "{}|>λ1*U.{}|>λA.{}|>."
+  , golden "recursive tail call of free var"
+           "let recfun = λx.case x of {\
+           \   TT() -> recfun z;\
+           \   FF() -> f } in \
+           \case b of { \
+           \   TT() -> recfun y;\
+           \   FF() -> λz. z }"
+           (callCtx 2)
+           "{b↦1*HU,f↦1*Ap[1;Ap[1;U]],y↦1*HU,z↦ω*HU}|>."
   ]
 
 -- qcProps = testGroup "(checked by QuickCheck)"

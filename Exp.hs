@@ -10,6 +10,8 @@ import qualified Data.Map as Map
 import Data.Char
 import GHC.Stack
 import Data.Functor.Classes (Eq2 (liftEq2))
+import Data.Set (Set)
+import qualified Data.Set as Set
 
 assert :: HasCallStack => Bool -> a -> a
 assert True  x = x
@@ -204,3 +206,12 @@ instance Read Exp where
         e <- Read.readPrec
         pure (k,xs,e)
 
+freeVars :: Exp -> Set Name
+freeVars (Var x) = Set.singleton x
+freeVars (Lam x e) = Set.delete x (freeVars e)
+freeVars (App e x) = Set.insert x (freeVars e)
+freeVars (Let x e1 e2) = Set.delete x (freeVars e1 `Set.union` freeVars e2)
+freeVars (ConApp _ xs) = Set.fromList xs
+freeVars (Case e alts) =
+  freeVars e `Set.union` Set.unions [ freeVars rhs `Set.difference` Set.fromList xs
+                                    | (xs, rhs) <- Map.elems alts ]

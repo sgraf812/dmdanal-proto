@@ -233,14 +233,17 @@ instance HasBind DmdD where
 ----------------------------------
 -- Entrypoints
 
-runDmd :: SubDemand -> DmdD -> DmdT DmdVal
-runDmd sd d = d sd
+dmdAnal :: Exp -> DmdD
+dmdAnal e = eval e initialEnv
+  where
+    initialEnv = Map.fromSet (\x -> step (Lookup x) (whnf DmdNop)) (freeVars e)
+
 
 anyCtx :: String -> DmdT DmdVal
-anyCtx s = runDmd Top $ eval (read s) emp
+anyCtx s = dmdAnal (read s) Top
 
 call :: Int -> String -> DmdT DmdVal
-call n s = runDmd (callCtx n) $ eval (read s) emp
+call n s = dmdAnal (read s) (callCtx n)
 
 {-
 >>> call 1 "let id = λx.x in id"
