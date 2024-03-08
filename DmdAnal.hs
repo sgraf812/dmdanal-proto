@@ -1,43 +1,18 @@
 {-# LANGUAGE DerivingVia #-}
+{-# LANGUAGE PatternSynonyms #-}
 module DmdAnal where
 
 import Prelude hiding ((+), (*))
-import qualified Prelude
 import Exp
 import Order
 import Interpreter
-import Data.Functor.Identity
-import Control.Monad.Trans.Writer
-import Control.Monad.Trans.Reader
 import qualified Data.Map as Map
 -- import Debug.Trace
 
+---------------------
+-- Abstract domain
+
 data U = U0 | U1 | Uω deriving (Eq, Ord)
-instance Show U where
-  show U0 = "0"
-  show U1 = "1"
-  show Uω = "ω"
-instance Lat U where
-  bottom = U0
-  U0  ⊔  u   = u
-  u   ⊔  U0  = u
-  U1  ⊔  U1  = U1
-  _   ⊔  _   = Uω
-class UVec a where
-  (+)  :: a -> a -> a
-  (*)  :: U -> a -> a
-infixl 6 +
-infixl 7 *
-instance UVec U where
-  U1 + U1 = Uω
-  u1 + u2 = u1 ⊔ u2
-  U0 * _ = U0
-  _ * U0 = U0
-  U1 * u = u
-  Uω * _ = Uω
-instance (Ord k, UVec u) => UVec (k :-> u) where
-  (+) = Map.unionWith (+)
-  u * m = Map.map (u *) m
 
 type UNonAbs  = U -- Not U0
 type UNonOnce = U -- Not U1
@@ -49,20 +24,39 @@ data SubDemand
   | Ap UNonAbs SubDemand    -- Apply context
   | Sel (Tag :-> [Demand])  -- Select context
 
-mkCall :: U -> SubDemand -> SubDemand
-mkCall U0 _   = Seq
-mkCall Uω Top = Top
-mkCall n  sd  = Ap n sd
+type DmdEnv = Name :-> Demand
 
-mkSingleScrut :: Tag -> [Demand] -> SubDemand
-mkSingleScrut k ds
-  | all (== absDmd) ds = Seq
-  | otherwise          = Sel (Map.singleton k ds)
+newtype DmdT a = DmdT (DmdEnv, a) deriving (Eq, Lat) via (DmdEnv,a)
+pattern φ :|> v = DmdT (φ, v)
+{-# COMPLETE (:|>) #-}
 
-absDmd :: Demand
-absDmd = Abs
-topDmd :: Demand
-topDmd = Uω :* Top
+data DmdVal = DmdFun Demand (DmdT DmdVal) | DmdNop | DmdBot
+
+type DmdD = SubDemand -> DmdT DmdVal
+
+-----------------
+-- Algebra
+
+class UVec a where
+  (+)  :: a -> a -> a
+  (*)  :: U -> a -> a
+infixl 6 +
+infixl 7 *
+
+instance Lat U where
+  bottom = U0
+  U0  ⊔  u   = u
+  u   ⊔  U0  = u
+  U1  ⊔  U1  = U1
+  _   ⊔  _   = Uω
+
+instance UVec U where
+  U1 + U1 = Uω
+  u1 + u2 = u1 ⊔ u2
+  U0 * _ = U0
+  _ * U0 = U0
+  U1 * u = u
+  Uω * _ = Uω
 
 zipWithEqual :: (a -> b -> c) -> [a] -> [b] -> [c]
 zipWithEqual f as bs | length as == length bs = zipWith f as bs
@@ -73,6 +67,192 @@ instance Lat Demand where
   Abs ⊔ d = d
   d ⊔ Abs = d
   (u1:*sd1) ⊔ (u2:*sd2) = (u1⊔u2) :* (sd1⊔sd2)
+
+instance UVec Demand where
+  Abs + d = d
+  d + Abs = d
+  (_u1:*sd1) + (_u2:*sd2) = Uω :* (sd1+sd2)
+  _ * Abs = Abs
+  U0 * _ = Abs
+  U1 * d = d
+  Uω * (_ :* sd) = Uω :* (Uω * sd)
+
+instance Lat SubDemand where
+  bottom = Seq
+  Top ⊔ _ = Top
+  _ ⊔ Top = Top
+  Seq ⊔ sd = sd
+  sd ⊔ Seq = sd
+  Ap n1 sd1 ⊔ Ap n2 sd2 = mkAp (n1⊔n2) (sd1⊔sd2)
+  Sel dmds1 ⊔ Sel dmds2
+    = Sel (Map.unionWith (zipWithEqual (⊔)) dmds1 dmds2)
+  _ ⊔ _ = Top
+
+instance UVec SubDemand where
+  Top + _ = Top
+  _ + Top = Top
+  Seq + sd = sd
+  sd + Seq = sd
+  Ap _n1 sd1 + Ap _n2 sd2 = mkAp Uω (sd1 ⊔ sd2)
+  Sel dmds1 + Sel dmds2
+    --- | and (Map.intersectionWith sameLength dmds1 dmds2) where sameLength = (==) `on` length
+    = Sel (Map.unionWith (zipWithEqual (+)) dmds1 dmds2)
+  _ + _ = Top
+  U0 * _ = Seq
+  U1 * sd = sd
+  Uω * Ap n sd = mkAp (n+n) sd
+  Uω * Sel dmds = Sel (Map.map (\dmds -> zipWith (+) dmds dmds) dmds)
+  Uω * sd = sd
+
+instance (Ord k, UVec u) => UVec (k :-> u) where
+  (+) = Map.unionWith (+)
+  u * m = Map.map (u *) m
+
+instance Lat DmdVal where
+  bottom = DmdBot
+  DmdNop ⊔ _ = DmdNop
+  _ ⊔ DmdNop = DmdNop
+  DmdBot ⊔ v = v
+  v ⊔ DmdBot = v
+  DmdFun d1 τ1 ⊔ DmdFun d2 τ2 = mkDmdFun (d1 ⊔ d2) (τ1 ⊔ τ2)
+
+---------------------------
+-- (Smart) Constructors
+
+mkAp :: U -> SubDemand -> SubDemand
+mkAp U0 _   = Seq
+mkAp Uω Top = Top
+mkAp n  sd  = Ap n sd
+
+asAp :: SubDemand -> (U, SubDemand)
+asAp (Ap n sd) = (n, sd)
+asAp Seq       = (U0, Seq)
+asAp _         = (Uω, Top)
+
+-- | A single call with n args in an otherwise unknown context
+callCtx :: Int -> SubDemand
+callCtx arity = iterate (Ap U1) Top !! arity
+
+mkSingleSel :: Tag -> [Demand] -> SubDemand
+mkSingleSel k ds
+  | all (== absDmd) ds = Seq
+  | otherwise          = Sel (Map.singleton k ds)
+
+absDmd, topDmd :: Demand
+absDmd = Abs
+topDmd = Uω :* Top
+
+whnf :: DmdVal -> DmdD
+whnf v = \_sd -> emp :|> v
+
+mkDmdFun :: Demand -> DmdT DmdVal -> DmdVal
+mkDmdFun d (φ :|> v) | d == topDmd, DmdNop <- v, all (== absDmd) φ = DmdNop
+                     | d == absDmd, DmdBot <- v, all (== absDmd) φ = DmdBot
+                     | otherwise                = DmdFun d (φ :|> v)
+
+--------------------------
+-- Domain definition
+
+instance Trace DmdD where
+  step (Lookup x) m = \sd ->
+    let φ :|> a = m sd in (φ + ext emp x (U1 :* sd)) :|> a
+  step _ τ = τ
+
+squeezeTSubDmd :: DmdT DmdVal -> SubDemand -> DmdEnv
+squeezeTSubDmd (φ :|> v) sd = φ + squeeze_val sd v
+  where
+    squeeze_val sd (DmdFun _ (φ :|> v))
+      | (n,sd') <- asAp sd = n*φ + squeeze_val sd' v
+    squeeze_val _ _ = emp -- DmdNop, DmdBot
+
+squeezeSubDmd :: DmdD -> SubDemand -> DmdEnv
+squeezeSubDmd f sd = squeezeTSubDmd (f sd) sd
+
+squeezeDmd :: DmdD -> Demand -> DmdEnv
+squeezeDmd _ Abs = emp
+squeezeDmd d (n :* sd)
+  | U1 <- n = squeezeSubDmd d sd
+  | Uω <- n = squeezeSubDmd d Seq + squeezeSubDmd d sd
+  | otherwise = error "UNonAbs"
+
+delFV :: DmdT DmdVal -> Name -> DmdT DmdVal
+delFV (φ :|> v) x = Map.delete x φ :|> del_value v
+  where
+    del_value (DmdFun d τ) = mkDmdFun d (delFV τ x)
+    del_value v = v
+
+instance Domain DmdD where
+  stuck = whnf DmdBot
+  fun x f = \sd ->
+    let proxy = step (Lookup x) (whnf DmdNop) in
+    let (_n,sd') = asAp sd in -- _n is the one-shot annotation
+    let τ = f proxy sd' in
+    let d = Map.findWithDefault absDmd x (squeezeTSubDmd τ sd') in
+    emp :|> mkDmdFun d (delFV τ x)
+  con k ds = \sd ->
+    let seq_dmds = replicate (length ds) absDmd in
+    let top_dmds = replicate (length ds) topDmd in
+    let dmds = case sd of
+          Sel kdss -> case Map.lookup k kdss of
+            Nothing                              -> seq_dmds
+            Just dmds | length dmds == length ds -> dmds
+                      | otherwise                -> top_dmds
+          Seq -> seq_dmds
+          _   -> top_dmds in
+    let φ = foldr (+) emp (zipWith squeezeDmd ds dmds) in
+    φ :|> DmdNop
+  apply f arg = \sd ->
+    case f (Ap U1 sd) of
+      φ :|> DmdFun dmd (φ' :|> v') -> (φ + φ' + squeezeDmd arg dmd) :|> v'
+      φ :|> DmdNop                 -> (φ + squeezeDmd arg topDmd  ) :|> DmdNop
+      φ :|> DmdBot                 -> (φ + emp                    ) :|> DmdBot
+  select scrut fs = \sd ->
+    let φ' :|> (scrut_sd,v) = lub (map (alt sd) (Map.assocs fs)) in
+    let φ  :|> _v = scrut scrut_sd in -- TODO: fixpoint for value _v? Currently we say DmdNop for field denotations
+    (φ+φ') :|> v
+    where
+      alt sd (k,(xs,f)) =
+        let proxies   = map (\x -> step (Lookup x) (whnf DmdNop)) xs in
+        let φ :|> v   = f proxies sd in
+        let (ds,φ')   = (map (\x -> Map.findWithDefault absDmd x φ) xs,foldr Map.delete φ xs) in
+        φ' :|> (mkSingleSel k ds, v)
+
+instance HasBind DmdD where
+  bind x rhs body = \sd ->
+    let iter v_rhs =
+          let proxy             = step (Lookup x) (whnf v_rhs)
+              φ_body :|> v_body = body proxy sd
+              φ_rhs :|>  v_rhs' = rhs  proxy sd_x
+              (ds_x, φ_body')   = (Map.findWithDefault absDmd x φ_body, Map.delete x φ_body)
+              (n_x, sd_x)       = case ds_x of Abs -> (U0, Seq); n :* sd -> (n,sd)
+              oneify u          = if u == Uω then U1 else u
+          in (v_rhs', v_body, φ_body' + (oneify n_x) * φ_rhs)
+        fstOf3 (a,_,_) = a
+    in case iter (kleeneFix (fstOf3 . iter)) of (_v_rhs, v, φ) -> φ :|> v
+
+----------------------------------
+-- Entrypoints
+
+runDmd :: SubDemand -> DmdD -> DmdT DmdVal
+runDmd sd d = d sd
+
+anyCtx :: String -> DmdT DmdVal
+anyCtx s = runDmd Top $ eval (read s) emp
+
+call :: Int -> String -> DmdT DmdVal
+call n s = runDmd (callCtx n) $ eval (read s) emp
+
+{-
+>>> call 1 "let id = λx.x in id"
+
+-- >>> call 2 "let const = λx.λy.y in const"
+--
+>>> call 2 "λx.λy.case y of { Some(z) -> z x; Pair(a,b) -> a b }"
+-}
+
+----------------------------------
+-- Boring stuff:
+
 instance Eq SubDemand where
   Seq == Seq = True
   Top == Top = True
@@ -83,231 +263,46 @@ instance Eq SubDemand where
 --  Sel dmds == Seq = all (all (== absDmd)) dmds -- not needed when normalised
 --  Top == Sel dmds = all (all (== topDmd)) dmds -- not true, unless dmds lists all constructors
   _   == _         = False
-instance Lat SubDemand where
-  bottom = Seq
-  Top ⊔ _ = Top
-  _ ⊔ Top = Top
-  Seq ⊔ sd = sd
-  sd ⊔ Seq = sd
-  Ap n1 sd1 ⊔ Ap n2 sd2 = mkCall (n1⊔n2) (sd1⊔sd2)
-  Sel dmds1 ⊔ Sel dmds2
-    = Sel (Map.unionWith (zipWithEqual (⊔)) dmds1 dmds2)
-  _ ⊔ _ = Top
 
-instance UVec Demand where
-  Abs + d = d
-  d + Abs = d
-  (_u1:*sd1) + (_u2:*sd2) = Uω :* (sd1+sd2)
-  _ * _ = error "unused"
+instance Eq DmdVal where
+  DmdFun d1 τ1 == DmdFun d2 τ2 = d1 == d2 && τ1 == τ2
+  DmdNop == DmdNop = True
+  DmdNop == DmdFun d2 (φ2 :|> v2) = topDmd == d2 && Map.null φ2 && DmdNop == v2
+  DmdNop == DmdBot = False
+  DmdBot == DmdBot = True
+  DmdBot == DmdFun d2 (φ2 :|> v2) = absDmd == d2 && Map.null φ2 && DmdBot == v2
+  l      == r      = r == l
 
-instance UVec SubDemand where
-  Top + _ = Top
-  _ + Top = Top
-  Seq + sd = sd
-  sd + Seq = sd
-  Ap _n1 sd1 + Ap _n2 sd2 = mkCall Uω (sd1 ⊔ sd2)
-  Sel dmds1 + Sel dmds2
-    --- | and (Map.intersectionWith sameLength dmds1 dmds2) where sameLength = (==) `on` length
-    = Sel (Map.unionWith (zipWithEqual (+)) dmds1 dmds2)
-
-  _ + _ = Top
-  _ * _ = error "unused"
+instance Show U where
+  show U0 = "0"
+  show U1 = "1"
+  show Uω = "ω"
 
 instance Show SubDemand where
-  show Seq = "Seq"
-  show Top = "T"
+  show Seq = "HU"
+  show Top = "U"
   show (Ap n sd) = "Ap["++show n ++ ";" ++ show sd ++ "]"
-  show (Sel kdss) = "Sel[" ++ concatMap single (Map.assocs kdss) ++ "]"
+  show (Sel kdss) = "Sel[" ++ showSep (showString ";") (map single (Map.assocs kdss)) "]"
     where
-      single (k, ds) = show k ++ "(" ++ showSep (showString ",") (map shows ds) ")"
+      single (k, ds) = shows k . showString "(" . showSep (showString ",") (map shows ds) . showString ")"
 
 instance Show Demand where
   show Abs = "A"
   show (n :* sd) = show n ++ "*" ++ show sd
 
-type DmdEnv = Name :-> Demand
+instance {-#  OVERLAPPING  #-} Show DmdEnv where
+  showsPrec _ = showSet (\(k,v) -> showString k . showString "↦" . shows v) . Map.toList
+showSet :: (a -> ShowS) ->  [a] -> ShowS
+showSet _     []     s = "{}" ++ s
+showSet showx (x:xs) s = '{' : showx x (showl xs)
+  where
+    showl []     = '}' : s
+    showl (y:ys) = ',' : showx y (showl ys)
 
-newtype DmdT a = DT { unDT :: SubDemand -> (a, DmdEnv) }
-  deriving (Functor,Applicative,Monad) via ReaderT SubDemand (Writer DmdEnv)
-
-type DmdD = DmdT DmdVal
-data DmdVal = DmdFun Demand DmdVal | DmdNop | DmdBot
-
-mkDmdFun :: Demand -> DmdVal -> DmdVal
-mkDmdFun d v | d == topDmd, DmdNop <- v = DmdNop
-             | d == absDmd, DmdBot <- v = DmdBot
-             | otherwise                = DmdFun d v
+instance Show v => Show (DmdT v) where
+  show (φ :|> v) = show φ ++ "|>" ++ show v
 
 instance Show DmdVal where
-  show DmdBot = "\\bottom"
-  show DmdNop = "\\bullet"
-  show (DmdFun d v) = show d ++ "\\rightarrow" ++ show v
-
-instance Eq DmdVal where
-  DmdFun d1 v1 == DmdFun d2 v2 = d1 == d2 && v1 == v2
-  DmdNop == DmdNop = True
-  DmdNop == DmdFun d2 v2 = topDmd == d2 && DmdNop == v2
-  DmdNop == DmdBot = False
-  DmdBot == DmdBot = True
-  DmdBot == DmdFun d2 v2 = absDmd == d2 && DmdBot == v2
-  l      == r      = r == l
-
-instance Lat DmdVal where
-  bottom = DmdBot
-  DmdNop ⊔ _ = DmdNop
-  _ ⊔ DmdNop = DmdNop
-  DmdBot ⊔ v = v
-  v ⊔ DmdBot = v
-  DmdFun d1 v1 ⊔ DmdFun d2 v2 = mkDmdFun (d1 ⊔ d2) (v1 ⊔ v2)
-
-mapDmdEnv :: (DmdEnv -> DmdEnv) -> DmdT v -> DmdT v
-mapDmdEnv f (DT m) = DT $ \sd -> case m sd of (v,φ) -> (v, f φ)
-
-instance Trace (DmdT v) where
-  step (Lookup x) (DT m) = DT $ \sd ->
-    let (a, φ) = m sd in (a, φ + ext emp x (U1 :* sd))
-  step _ τ = τ
-
-isProd :: Tag -> Bool
-isProd Pair = True
-isProd _    = False -- TT,FF,Some,None,S,Z
-
-squeezeSubDmd :: DmdD -> SubDemand -> DmdEnv
-squeezeSubDmd (DT f) sd = snd (f sd)
-
-squeezeDmd :: DmdD -> Demand -> DmdEnv
-squeezeDmd _ Abs = emp
-squeezeDmd d (n :* sd)
-  | U1 <- n = squeezeSubDmd d sd
-  | Uω <- n = squeezeSubDmd d sd + squeezeSubDmd d Seq
-  | otherwise = error "UNonAbs"
-
-instance Domain (DmdT DmdVal) where
-  stuck = return DmdBot
-  fun x f = DT $ \sd ->
-    let proxy = step (Lookup x) (pure DmdNop) in
-    let (n,sd') = case sd of
-          Ap n sd' -> (n, sd')
-          Seq        -> (U0, Seq)
-          _          -> (Uω, Top) in
-    if n == U0
-      then (DmdBot, emp)
-      else
-        let (v,φ)  = unDT (f proxy) sd' in
-        let (d,φ') = (Map.findWithDefault absDmd x φ,Map.delete x φ) in
-        (multDmdVal n (mkDmdFun d v), n * φ')
-  con k ds = DT $ \sd ->
-    let seq_dmds = replicate (length ds) absDmd
-        top_dmds = replicate (length ds) topDmd
-        dmds = case sd of
-          Sel kdss -> case Map.lookup k kdss of
-            Nothing                              -> seq_dmds
-            Just dmds | length dmds == length ds -> dmds
-                      | otherwise                -> top_dmds
-          Seq -> seq_dmds
-          _   -> top_dmds in
-    (DmdNop, foldr (+) emp (zipWith squeezeDmd ds dmds))
-  apply (DT f) arg = DT $ \sd ->
-    case f (Ap U1 sd) of
-      (DmdFun dmd v', φ) -> (v',     φ + squeezeDmd arg dmd)
-      (DmdNop       , φ) -> (DmdNop, φ + squeezeDmd arg topDmd)
-      (DmdBot       , φ) -> (DmdBot, φ + emp)
-  select (DT scrut) fs = DT $ \sd -> case Map.assocs fs of
-    [(k,(xs,f))] | k == Pair ->
-      let proxies   = map (\x -> step (Lookup x) (pure DmdNop)) xs in
-      let (v,φ)     = unDT (f proxies) sd in
-      let (ds,φ')   = (map (\x -> Map.findWithDefault absDmd x φ) xs,foldr Map.delete φ xs) in
-      case scrut (mkSingleScrut k ds) of
-        (_v,φ'') -> (v,φ''+φ')
-    fs ->
-      let (_v,φ) = scrut Top in
-      let (v,φ') = lub (map (alt sd) fs) in
-      (v, φ+φ')
-      where
-        alt sd (k,(xs,f)) =
-          let proxies   = map (\_ -> pure DmdNop) xs in
-          let (v,φ)     = unDT (f proxies) sd in
-          let φ'        = foldr Map.delete φ xs in
-          (v,φ')
-
--- | Very hacky way to see the arity of a function
-arity :: DmdD -> Int
-arity (DT m) = go 0
-  where
-    go n
-      | n > 100                       = n
-      | φ /= emp                      = n
-      | v /= DmdBot                   = n
-      | otherwise                     = go (n Prelude.+ 1)
-      where
-        sd = iterate (Ap U1) Seq !! n
-        (v,φ) = m sd
-
-nopD' :: DmdD
-nopD' = DT $ \_ -> (DmdNop, emp)
-
-peelManyCalls :: Int -> SubDemand -> (U, SubDemand)
-peelManyCalls 0 sd = (U1,sd)
-peelManyCalls _ Seq = (U0, Seq)
-peelManyCalls _ Top = (Uω, Top)
-peelManyCalls _ Sel{} = (Uω, Top)
-peelManyCalls n (Ap u sd) | (u',sd') <- peelManyCalls (n-1) sd = (u * u', sd')
-
-multDmdVal :: U -> DmdVal -> DmdVal
-multDmdVal U0 _ = DmdNop
-multDmdVal Uω (DmdFun d v) = mkDmdFun (d+d) (multDmdVal Uω v)
-multDmdVal _  v = v
-
-type DmdSummary = (DmdVal, DmdEnv)
-
-concDmdSummary :: Int -> DmdSummary -> DmdD
-concDmdSummary arty (v,φ) = DT $ \sd ->
-  let (u,_body_sd) = peelManyCalls arty sd in
-  (multDmdVal u v, u * φ)
-
-
--- | A single call with n args in an otherwise unknown context
-callSd :: Int -> SubDemand
-callSd arity = iterate (Ap U1) Top !! arity
-
-absDmdSummary :: Int -> DmdD -> DmdSummary
-absDmdSummary arty (DT d) = d (callSd arty)
-
-instance HasBind DmdD where
-  bind x rhs body = DT $ \sd ->
-    let arty = arity (rhs nopD') in
---    if trace (show arty) arty == 0
-    if arty == 0
-      then
-        let proxy = step (Lookup x) (pure DmdNop) in
-        case unDT (body proxy) sd of -- LetUp
-          (v,φ) ->
-            case Map.findWithDefault absDmd x φ of
-              Abs -> (v,Map.delete x φ)
-              _n :* sd -> let (_sd2,_v2,φ2) = kleeneFix (letup x rhs sd) in (v,Map.delete x (φ + φ2))
-      else
-        let d1 = concDmdSummary arty (kleeneFix (absDmdSummary arty . rhs . concDmdSummary arty)) in
-        unDT (body d1) sd
-    where
-      letup x rhs sd (sd',v,_φ) =
-        let sd'' = sd ⊔ sd' in
-        case unDT (rhs (step (Lookup x) (pure v))) sd'' of
-          (v',φ') ->
-            case Map.findWithDefault absDmd x φ' of
-              Abs -> (sd'',v',φ')
-              _n :* sd''' -> (sd'' ⊔ sd''',v',φ')
-
-runDmd :: SubDemand -> DmdD -> (DmdVal, DmdEnv)
-runDmd sd (DT d) = d sd
-
-anyCtx :: String -> (DmdVal, DmdEnv)
-anyCtx s = runDmd Top $ eval (read s) emp
-
-call :: Int -> String -> (DmdVal, DmdEnv)
-call n s = runDmd (callSd n) $ eval (read s) emp
-
-{-
->>> call 1 "let id = λx.x in id"
-
--- >>> call 2 "let const = λx.λy.y in const"
--}
+  show DmdBot = "⊥"
+  show DmdNop = "."
+  show (DmdFun d τ) = "λ" ++ show d ++ "." ++ show τ
