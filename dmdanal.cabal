@@ -13,15 +13,20 @@ extra-doc-files:    CHANGELOG.md
 -- extra-source-files:
 
 common warnings
-    ghc-options: -Wall
+    ghc-options: -W
 
 library
     import:           warnings
-    exposed-modules:  DmdAnal
-    -- other-modules:
+    exposed-modules:  DmdAnal, Interpreter, Exp, Order
     -- other-extensions:
     build-depends:    base
                     , transformers
                     , containers
     hs-source-dirs:   .
     default-language: GHC2021
+
+test-suite tests
+    type:       exitcode-stdio-1.0
+    hs-source-dirs: tests
+    main-is:    Main.hs
+    build-depends: base, dmdanal, tasty, tasty-hunit
