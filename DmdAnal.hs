@@ -9,7 +9,8 @@ import Interpreter
 import qualified Data.Map as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
--- import Debug.Trace
+import Debug.Trace
+_ = trace
 
 ---------------------
 -- Abstract domain
@@ -33,10 +34,10 @@ pattern φ :|> v = DmdT (φ, v)
 {-# COMPLETE (:|>) #-}
 
 data DmdVal
-  = DmdBot
-  | DmdFun Demand (DmdT DmdVal)
-  | DmdCon (Tag :-> [DmdVal])
-  | DmdNop (Set Name)
+  = DmdBot                      -- ⊥
+  | DmdFun Demand (DmdT DmdVal) -- λdmd.{x↦dmd}|>val
+  | DmdCon (Tag :-> [DmdVal])   -- Con[K1(val,val,...); K2(val,val,...)]
+  | DmdNop (Set Name)           -- .{fvs}
 
 type DmdD = SubDemand -> DmdT DmdVal
 
@@ -65,8 +66,7 @@ instance UVec U where
   Uω * _ = Uω
 
 zipWithEqual :: (a -> b -> c) -> [a] -> [b] -> [c]
-zipWithEqual f as bs | length as == length bs = zipWith f as bs
-                     | otherwise              = error "not same length"
+zipWithEqual f as bs = assertMsg (length as == length bs) "not same length" (zipWith f as bs)
 
 instance Lat Demand where
   bottom = Abs
@@ -167,6 +167,12 @@ mkDmdFun d (φ :|> v) | d == topDmd, DmdNop fvs <- v, topEnv fvs == φ = v
                      | d == absDmd, all (== absDmd) φ, DmdBot <- v   = DmdBot
                      | otherwise                                     = DmdFun d (φ :|> v)
 
+asDmdFun :: DmdVal -> (Demand, DmdEnv, DmdVal)
+asDmdFun (DmdFun dmd (φ :|> v)) = (dmd, φ, v)
+asDmdFun DmdBot                 = (absDmd, emp, DmdBot)
+asDmdFun (DmdNop fvs)           = (topDmd, Map.fromSet (const topDmd) fvs, DmdNop Set.empty)
+asDmdFun v@(DmdCon _)           = assert (null (valFVs v)) (topDmd, emp, DmdNop Set.empty) -- topDmd is conservative; could do absDmd
+
 --------------------------
 -- Domain definition
 
@@ -229,17 +235,18 @@ instance Domain DmdD where
     let φ = foldr (+) emp (zipWith squeezeDmd ds dmds) in
     φ :|> DmdCon (Map.singleton k (zipWith valueShell ds dmds))
   apply f arg = \sd ->
-    case f (Ap U1 sd) of
-      φ :|> DmdBot                 -> (φ + emp                    ) :|> DmdBot
-      φ :|> DmdFun dmd (φ' :|> v') -> (φ + φ' + squeezeDmd arg dmd) :|> v'
-      φ :|> v                      -> (φ + squeezeDmd arg topDmd  ) :|> DmdNop (valFVs v)
+    let φ :|> v = f (Ap U1 sd) in
+--    trace ("apply " ++ show (φ :|> v)) $
+    let (dmd, φ', v') = asDmdFun v in
+    (φ + φ' + squeezeDmd arg dmd) :|> v'
   select scrut fs = \sd ->
     let nop_fields (xs, _f) = map (const (DmdNop Set.empty)) xs in
     let nop_scrut_v = DmdCon (nop_fields << fs) in -- the worst case value
     let iter v_scrut =
           let φ' :|> (scrut_sd,v_rhss) = lub (map (alt v_scrut sd) (Map.assocs fs)) in
-          let φ  :|> v_scrut' = scrut scrut_sd in -- TODO: fixpoint for value _v? Currently we say DmdNop for field denotations
+          let φ  :|> v_scrut' = scrut scrut_sd in
           (v_scrut', (φ+φ') :|> v_rhss) in
+--    snd (iter nop_scrut_v) -- the regular version without a fixpoint; then we cannot know v_scrut'
     snd (iter (kleeneFixFrom nop_scrut_v (fst . iter)))
     where
       alt v_scrut sd (k,(xs,f)) = case lookupDmdCon k v_scrut of
@@ -260,13 +267,14 @@ lookupDmdCon _ _ = Nothing -- DmdBot, DmdFun
 instance HasBind DmdD where
   bind x rhs body = \sd ->
     let iter v_rhs =
-          let proxy             = step (Lookup x) (whnf v_rhs)
-              φ_body :|> v_body = body proxy sd
-              φ_rhs :|>  v_rhs' = rhs  proxy sd_x
-              (ds_x, φ_body')   = (Map.findWithDefault absDmd x φ_body, Map.delete x φ_body)
+          let τ_body            = body (whnf v_rhs) sd
+              φ_rhs :|>  v_rhs' = rhs  (whnf v_rhs) sd_x
+              ds_x              = Map.findWithDefault absDmd x (squeezeTSubDmd τ_body sd)
+              φ_body :|> v_body = delFV x τ_body
               (n_x, sd_x)       = case ds_x of Abs -> (U0, Seq); n :* sd -> (n,sd)
               oneify u          = if u == Uω then U1 else u
-          in (v_rhs', v_body, φ_body' + (oneify n_x) * φ_rhs)
+          in -- trace ("bind " ++ x ++ ": " ++ show ds_x ++ ", " ++ show v_rhs' ++ ", " ++ show τ_body)
+             (v_rhs', v_body, φ_body + (oneify n_x) * φ_rhs)
         fstOf3 (a,_,_) = a
     in case iter (kleeneFix (fstOf3 . iter)) of (_v_rhs, v, φ) -> φ :|> v
 

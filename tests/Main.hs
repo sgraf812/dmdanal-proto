@@ -49,6 +49,14 @@ unitTests = testGroup "Unit tests"
            \case z of { Some(f) -> f x1 x2; None() -> x3 }"
            Top
            "{x1↦1*U}|>."
+  , golden "#7994"
+           "let go = λx. \
+           \  let pap = case top x of { FF() -> it; TT() -> let t1 = S(x) in go t1 } in \
+           \  let b = top x in \
+           \  λy. let t2 = top b y in pap t2 \
+           \in go top top"
+           Top
+           "{it↦1*Ap[1;U],top↦ω*U}|>." -- main point: it↦1*Ap[1;U] in the loop exit of `go`, indicating we may eta-expand `pap` and `go`
   ]
 
 -- qcProps = testGroup "(checked by QuickCheck)"
