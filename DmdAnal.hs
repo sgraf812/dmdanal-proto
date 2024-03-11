@@ -131,7 +131,11 @@ instance Lat DmdVal where
   v1 ⊔ v2 = DmdNop (valFVs v1 `Set.union` valFVs v2)
 
 ---------------------------
--- (Smart) Constructors
+-- Manipulating the semantic domain (SubDemand, Demand, DmdEnv, DmdVal)
+
+absDmd, topDmd :: Demand
+absDmd = Abs
+topDmd = Uω :* Top
 
 mkAp :: U -> SubDemand -> SubDemand
 mkAp U0 _   = Seq
@@ -152,15 +156,19 @@ mkSingleSel k ds
   | all (== absDmd) ds = Seq
   | otherwise          = Sel (Map.singleton k ds)
 
-absDmd, topDmd :: Demand
-absDmd = Abs
-topDmd = Uω :* Top
-
-whnf :: DmdVal -> DmdD
-whnf v = \_sd -> emp :|> v
+lookupSelDmds :: Tag -> SubDemand -> [Demand]
+lookupSelDmds k Seq = replicate (conArity k) absDmd
+lookupSelDmds k (Sel kdss) = case Map.lookup k kdss of
+  Nothing                               -> replicate (conArity k) absDmd
+  Just dmds | length dmds == conArity k -> dmds
+            | otherwise                 -> replicate (conArity k) topDmd
+lookupSelDmds k _ = replicate (conArity k) topDmd
 
 topEnv :: Set Name -> DmdEnv
 topEnv fvs = Map.fromSet (const topDmd) fvs
+
+whnf :: DmdVal -> DmdD
+whnf v = \_sd -> emp :|> v
 
 mkDmdFun :: Demand -> DmdT DmdVal -> DmdVal
 mkDmdFun d (φ :|> v) | d == topDmd, DmdNop fvs <- v, topEnv fvs == φ = v
@@ -173,33 +181,42 @@ asDmdFun DmdBot                 = (absDmd, emp, DmdBot)
 asDmdFun (DmdNop fvs)           = (topDmd, Map.fromSet (const topDmd) fvs, DmdNop Set.empty)
 asDmdFun v@(DmdCon _)           = assert (null (valFVs v)) (topDmd, emp, DmdNop Set.empty) -- topDmd is conservative; could do absDmd
 
---------------------------
--- Domain definition
+lookupDmdCon :: Tag -> DmdVal -> Maybe [DmdVal]
+lookupDmdCon k (DmdCon kvs) = Map.lookup k kvs
+lookupDmdCon k (DmdNop _)   = Just (replicate (conArity k) (DmdNop Set.empty)) -- TODO: Assert that DmdNop has no free vars
+lookupDmdCon _ _ = Nothing -- DmdBot, DmdFun
 
-instance Trace DmdD where
-  step (Lookup x) m = \sd ->
-    let φ :|> a = m sd in (φ + ext emp x (U1 :* sd)) :|> a
-  step _ τ = τ
-
-squeezeTSubDmd :: DmdT DmdVal -> SubDemand -> DmdEnv
-squeezeTSubDmd (φ :|> v) sd = φ + squeeze_val sd v
+squeezeSubDmd :: DmdT DmdVal -> SubDemand -> DmdEnv
+squeezeSubDmd (φ :|> v) sd = φ + squeeze_val sd v
   where
     squeeze_val sd (DmdFun _ (φ :|> v))
       | (n,sd') <- asAp sd = n*φ + squeeze_val sd' v
     squeeze_val _ _ = emp -- DmdNop, DmdBot, DmdCon. NB: DmdCon has no valFVs!!!
 
-squeezeSubDmd :: DmdD -> SubDemand -> DmdEnv
-squeezeSubDmd f sd = squeezeTSubDmd (f sd) sd
-
-squeezeDmd :: DmdD -> Demand -> DmdEnv
-squeezeDmd _ Abs = emp
-squeezeDmd d (n :* sd)
-  | U1 <- n = squeezeSubDmd d sd
-  | Uω <- n = squeezeSubDmd d Seq + squeezeSubDmd d sd
+squeezeEnv :: DmdD -> Demand -> DmdEnv
+-- Applied to free variable denotations in ρ.
+-- DmdAnal maintains that every such ρ(x) looks like
+-- `step (Lookup y) (whnf v)` for some variable `y` and value `v`.
+-- This is important to understand the Uω case below.
+squeezeEnv _ Abs = emp
+squeezeEnv d (n :* sd)
+  | U1 <- n = squeezeSubDmd (d sd) sd
+  | Uω <- n = squeezeSubDmd (d Seq) Seq + squeezeSubDmd (d sd) sd
+     -- See comment on squeezeEnv; `squeezeSubDmd (d Seq) Seq` will only
+     -- add a (U1 :* Seq) demand on the variable `y`, because the rest
+     -- of the DmdD is in WHNF (`whnf v`).
+     -- The second `squeezeSubDmd (d sd) sd` will then add (U1 :* sd) on
+     -- `y` as well as add uses from `v`.
   | otherwise = error "UNonAbs"
 
--- | We will have `valFVs (valueShell d sd) == Set.empty`.
 valueShell :: DmdD -> Demand -> DmdVal
+-- It is `valFVs (valueShell d sd) == Set.empty`.
+--
+-- Important property: For all `d :: DmdD` and `dmd :: Demand`,
+-- define `d' = squeezeEnv d dmd :|> valueShell d dmd`.
+-- Then we have `squeezeEnv d dmd ⊑ squeezeEnv d' dmd`.
+-- I.e., d' is a "squeezed" approximation of d, where all uses of free variables
+-- are in the outer φ.
 valueShell _ Abs       = DmdBot
 valueShell d (_ :* sd) = case d sd of _ :|> v -> go v
   where
@@ -214,31 +231,36 @@ delFV x (φ :|> v) = Map.delete x φ :|> del_value v
     del_value (DmdFun d τ) = mkDmdFun d (delFV x τ)
     del_value v = v
 
+lookupDmdEnv :: Name -> DmdEnv -> Demand
+lookupDmdEnv x φ = Map.findWithDefault absDmd x φ
+
+--------------------------
+-- Domain definition
+
+mkProxy :: Name -> DmdVal -> DmdD
+mkProxy x v = step (Lookup x) (whnf v)
+
+instance Trace DmdD where
+  step (Lookup x) m = \sd ->
+    let φ :|> a = m sd in (φ + ext emp x (U1 :* sd)) :|> a
+  step _ τ = τ
+
 instance Domain DmdD where
   stuck = whnf DmdBot
   fun x f = \sd ->
-    let proxy = step (Lookup x) (whnf (DmdNop Set.empty)) in
-    let (_n,sd') = asAp sd in -- _n is the one-shot annotation
-    let τ = f proxy sd' in
-    let d = Map.findWithDefault absDmd x (squeezeTSubDmd τ sd') in
+    let (_n,sd') = asAp sd in -- _n is the one-shot annotation that goes on the lambda
+    let τ = f (mkProxy x (DmdNop Set.empty)) sd' in
+    let d = lookupDmdEnv x (squeezeSubDmd τ sd') in
     emp :|> mkDmdFun d (delFV x τ)
   con k ds = \sd ->
-    let seq_dmds = replicate (length ds) absDmd in
-    let top_dmds = replicate (length ds) topDmd in
-    let dmds = case sd of
-          Sel kdss -> case Map.lookup k kdss of
-            Nothing                              -> seq_dmds
-            Just dmds | length dmds == length ds -> dmds
-                      | otherwise                -> top_dmds
-          Seq -> seq_dmds
-          _   -> top_dmds in
-    let φ = foldr (+) emp (zipWith squeezeDmd ds dmds) in
+    let dmds = lookupSelDmds k sd in
+    let φ = foldr (+) emp (zipWith squeezeEnv ds dmds) in
     φ :|> DmdCon (Map.singleton k (zipWith valueShell ds dmds))
-  apply f arg = \sd ->
-    let φ :|> v = f (Ap U1 sd) in
+  apply f_body arg = \sd ->
+    let φ :|> v = f_body (Ap U1 sd) in
 --    trace ("apply " ++ show (φ :|> v)) $
     let (dmd, φ', v') = asDmdFun v in
-    (φ + φ' + squeezeDmd arg dmd) :|> v'
+    (φ + φ' + squeezeEnv arg dmd) :|> v'
   select scrut fs = \sd ->
     let nop_fields (xs, _f) = map (const (DmdNop Set.empty)) xs in
     let nop_scrut_v = DmdCon (nop_fields << fs) in -- the worst case value
@@ -249,32 +271,26 @@ instance Domain DmdD where
 --    snd (iter nop_scrut_v) -- the regular version without a fixpoint; then we cannot know v_scrut'
     snd (iter (kleeneFixFrom nop_scrut_v (fst . iter)))
     where
-      alt v_scrut sd (k,(xs,f)) = case lookupDmdCon k v_scrut of
+      alt v_scrut sd (k,(xs,f_rhs)) = case lookupDmdCon k v_scrut of
         Nothing -> bottom -- dead code path; return bot
         Just vs ->
-          let proxies = zipWithEqual (\x v -> step (Lookup x) (whnf v)) xs vs in
-          let τ = f proxies sd in
-          let ds = let φ = squeezeTSubDmd τ sd in
-                   map (\x -> Map.findWithDefault absDmd x φ) xs in
+          let τ = f_rhs (zipWithEqual mkProxy xs vs) sd in
+          let ds = let φ = squeezeSubDmd τ sd in
+                   map (\x -> lookupDmdEnv x φ) xs in
           let φ :|> v = foldr delFV τ xs in
           φ :|> (mkSingleSel k ds, v)
-
-lookupDmdCon :: Tag -> DmdVal -> Maybe [DmdVal]
-lookupDmdCon k (DmdCon kvs) = Map.lookup k kvs
-lookupDmdCon k (DmdNop _)   = Just (replicate (conArity k) (DmdNop Set.empty)) -- TODO: Assert that DmdNop has no free vars
-lookupDmdCon _ _ = Nothing -- DmdBot, DmdFun
 
 instance HasBind DmdD where
   bind x rhs body = \sd ->
     let iter v_rhs =
-          let τ_body            = body (whnf v_rhs) sd
+          let τ_body            = body (whnf v_rhs) sd    -- NB: eval will wrap `step (Lookup x)` around `whnf v_rhs`, as in `mkProxy`
               φ_rhs :|>  v_rhs' = rhs  (whnf v_rhs) sd_x
-              ds_x              = Map.findWithDefault absDmd x (squeezeTSubDmd τ_body sd)
-              φ_body :|> v_body = delFV x τ_body
+              ds_x              = lookupDmdEnv x (squeezeSubDmd τ_body sd)
               (n_x, sd_x)       = case ds_x of Abs -> (U0, Seq); n :* sd -> (n,sd)
-              oneify u          = if u == Uω then U1 else u
+              oneify u          = if u == Uω then U1 else u -- `oneify u = glb U1 u = U1 ∩ u`
+              φ_body :|> v_body = delFV x τ_body
           in -- trace ("bind " ++ x ++ ": " ++ show ds_x ++ ", " ++ show v_rhs' ++ ", " ++ show τ_body)
-             (v_rhs', v_body, φ_body + (oneify n_x) * φ_rhs)
+             (v_rhs', v_body, φ_body + (oneify n_x * φ_rhs))
         fstOf3 (a,_,_) = a
     in case iter (kleeneFix (fstOf3 . iter)) of (_v_rhs, v, φ) -> φ :|> v
 
@@ -284,7 +300,7 @@ instance HasBind DmdD where
 dmdAnal :: Exp -> DmdD
 dmdAnal e = eval e initialEnv
   where
-    initialEnv = Map.fromSet (\x -> step (Lookup x) (whnf (DmdNop Set.empty))) (freeVars e)
+    initialEnv = Map.fromSet (\x -> mkProxy x (DmdNop Set.empty)) (freeVars e)
 
 
 anyCtx :: String -> DmdT DmdVal
