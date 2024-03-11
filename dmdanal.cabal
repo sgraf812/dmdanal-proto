@@ -17,7 +17,7 @@ common warnings
 
 library
     import:           warnings
-    exposed-modules:  DmdAnal, Interpreter, Exp, Order
+    exposed-modules:  DmdAnal, Interpreter, Exp, Order, NbE
     -- other-extensions:
     build-depends:    base
                     , transformers
