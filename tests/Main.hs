@@ -29,11 +29,11 @@ unitTests = testGroup "Unit tests"
   [ golden "const expr"
            "λx.λy.x"
            (callCtx 2)
-           "{}|>λ1*U.{}|>λA.{}|>."
+           "{}|>λ1*U.{}|>λA.{}|>end"
   , golden "const binding"
            "let const = λx.λy.x in const"
            (callCtx 2)
-           "{}|>λ1*U.{}|>λA.{}|>."
+           "{}|>λ1*U.{}|>λA.{}|>end"
   , golden "eta-expandable loop with call in exit"
            "let loop = λx.case x of {\
            \   TT() -> loop z;\
@@ -42,13 +42,13 @@ unitTests = testGroup "Unit tests"
            \   TT() -> loop y;\
            \   FF() -> λz. z }"
            (callCtx 2)
-           "{b↦1*HU,f↦1*Ap[1;Ap[1;U]],y↦1*HU,z↦ω*HU}|>."
+           "{b↦1*HU,f↦1*Ap[1;Ap[1;U]],y↦1*HU,z↦ω*HU}|>end"
   , golden "DataCon values Some(const)"
            "let const = λx.λy.x in \
            \let z = Some(const) in \
            \case z of { Some(f) -> f x1 x2; None() -> x3 }"
            Top
-           "{x1↦1*U}|>."
+           "{x1↦1*U}|>end"
   , golden "#7994"
            "let go = λx. \
            \  let pap = case top x of { FF() -> it; TT() -> let t1 = S(x) in go t1 } in \
@@ -56,7 +56,7 @@ unitTests = testGroup "Unit tests"
            \  λy. let t2 = top b y in pap t2 \
            \in go top top"
            Top
-           "{it↦1*Ap[1;U],top↦ω*U}|>." -- main point: it↦1*Ap[1;U] in the loop exit of `go`, indicating we may eta-expand `pap` and `go`
+           "{it↦1*Ap[1;U],top↦ω*U}|>end" -- main point: it↦1*Ap[1;U] in the loop exit of `go`, indicating we may eta-expand `pap` and `go`
   ]
 
 -- qcProps = testGroup "(checked by QuickCheck)"

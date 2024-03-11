@@ -37,7 +37,7 @@ data DmdVal
   = DmdBot                      -- ⊥
   | DmdFun Demand (DmdT DmdVal) -- λdmd.{x↦dmd}|>val
   | DmdCon (Tag :-> [DmdVal])   -- Con[K1(val,val,...); K2(val,val,...)]
-  | DmdNop (Set Name)           -- .{fvs}
+  | DmdNop (Set Name)           -- end{fvs}
 
 type DmdD = SubDemand -> DmdT DmdVal
 
@@ -369,7 +369,7 @@ instance Show v => Show (DmdT v) where
 
 instance Show DmdVal where
   show DmdBot = "⊥"
-  show (DmdNop fvs) = "." ++ if Set.null fvs then "" else showSet showString (Set.toList fvs) ""
+  show (DmdNop fvs) = "end" ++ if Set.null fvs then "" else showSet showString (Set.toList fvs) ""
   show (DmdFun d τ) = "λ" ++ show d ++ "." ++ show τ
   show (DmdCon dkvs) = "Con[" ++ showSep (showString ";") (map single (Map.assocs dkvs)) "]"
     where
